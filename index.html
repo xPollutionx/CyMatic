@@ -1499,8 +1499,51 @@ function detectPitch(data) {
 }
 
 // ── Audio ──────────────────────────────────────────
+
+// Android WebView exposes navigator.mediaDevices but silently drops
+// permission requests unless we use the Permissions API first to
+// trigger the native dialog, then fall back gracefully.
+async function requestMicPermission() {
+  // Path 1: Modern Permissions API (Chrome/Android WebView 60+)
+  if (navigator.permissions && navigator.permissions.query) {
+    try {
+      const status = await navigator.permissions.query({ name: 'microphone' });
+      if (status.state === 'denied') {
+        alert('Microphone blocked. Please enable it in your device Settings → Apps → CyMatic → Permissions.');
+        return false;
+      }
+    } catch(e) { /* some WebViews don't support permissions.query — carry on */ }
+  }
+  return true;
+}
+
+async function getMicStream() {
+  // Constraints ordered from most to least specific — WebView needs
+  // echoCancellation:false to avoid the Android audio session conflict
+  const constraints = [
+    { audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }, video: false },
+    { audio: { echoCancellation: true }, video: false },
+    { audio: true, video: false }
+  ];
+  for (const c of constraints) {
+    try {
+      return await navigator.mediaDevices.getUserMedia(c);
+    } catch(e) {
+      if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError') {
+        // Hard deny — no point retrying with looser constraints
+        throw e;
+      }
+      // NotFoundError, OverconstrainedError etc — try next set
+    }
+  }
+  throw new Error('No mic available');
+}
+
 async function startAudio() {
   audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+  // Android WebView often starts AudioContext suspended — resume on user gesture
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
+
   analyser = audioCtx.createAnalyser();
   analyser.fftSize = 2048;
   analyser.smoothingTimeConstant = 0.8;
@@ -1516,13 +1559,24 @@ async function startAudio() {
     if (!currentSource.includes('mic')) gainNode.connect(audioCtx.destination);
     osc.start();
   }
+
   if (currentSource==='mic'||currentSource==='both'||currentSource==='generated_mic') {
-    try {
-      micStream = await navigator.mediaDevices.getUserMedia({audio:true,video:false});
-      micSrc = audioCtx.createMediaStreamSource(micStream);
-      micSrc.connect(analyser);
-    } catch(e) { alert('Mic access denied'); }
+    const allowed = await requestMicPermission();
+    if (allowed) {
+      try {
+        micStream = await getMicStream();
+        micSrc = audioCtx.createMediaStreamSource(micStream);
+        micSrc.connect(analyser);
+      } catch(e) {
+        if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError') {
+          alert('Microphone permission denied.\n\nOn Android: Settings → Apps → CyMatic → Permissions → Microphone → Allow.');
+        } else {
+          alert('Could not access microphone: ' + e.message);
+        }
+      }
+    }
   }
+
   if (currentSource==='device'||currentSource==='both') {
     try {
       dispStream = await navigator.mediaDevices.getDisplayMedia({video:true, audio:true});
